@@ -1,0 +1,12 @@
+[submodule "archive_core"]
+	path = archive_core
+	url = https://github.com/maherani/enterprise-archive-system.git
+	branch = release/v2-staging-verified
+[submodule "ai_box_gateway"]
+	path = ai_box_gateway
+	url = https://github.com/maherani/ai_box_gateway.git
+	branch = release/v2-staging-verified
+[submodule "integration_layer"]
+	path = integration_layer
+	url = https://github.com/maherani/integration_layer.git
+	branch = release/v2-staging-verified

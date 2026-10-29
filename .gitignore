@@ -1,0 +1,9 @@
+# Environment files
+.env
+*.local.env
+
+# Logs and runtime artifacts
+*.log
+*.tmp
+.DS_Store
+Thumbs.db

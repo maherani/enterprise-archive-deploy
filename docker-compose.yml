@@ -1,0 +1,10 @@
+# ==============================================================================
+# Enterprise Archive System - Master Orchestrator (Umbrella Deployment)
+# Orchestrates 3 Layers: Archive Core, AI Box Gateway & Integration Layer
+# ==============================================================================
+
+name: enterprise-archive-deploy
+
+include:
+  - archive_core/docker-compose.yml
+  - ai_box_gateway/docker-compose.yml
