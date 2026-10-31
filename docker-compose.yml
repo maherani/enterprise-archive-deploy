@@ -40,7 +40,6 @@ services:
     volumes:
       - nextcloud_html:/var/www/html
       - ./archive_core/apps/archive_autotag:/var/www/html/custom_apps/archive_autotag:ro
-      - ./archive_core/deploy:/var/www/html/deploy:ro
     environment:
       - POSTGRES_HOST=db
       - POSTGRES_DB=${POSTGRES_DB:-nextcloud}
