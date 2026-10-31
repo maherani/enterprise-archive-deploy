@@ -1,297 +1,221 @@
-# ران‌بوک جامع استقرار سامانه و بازیابی در سرور جدید (System Deployment & Recovery Runbook)
-**سامانه بایگانی اسناد سازمانی بانک مسکن • نسخه مصوب Production**
+# راهنمای جامع استقرار و راهبری سامانه آرشیو اسناد سازمانی (Runbook v2.0)
+
+> **نسخه سند:** v2.0 (ویرایش معماری زیرماژول‌ها و Named Volumes)  
+> **شاخه هدف:** `release/v2-staging-verified`  
+> **مخزن ارکستراتور:** `enterprise-archive-deploy`  
+> **مخاطب:** تیم‌های DevOps، مدیران سیستم و مهندسان استقرار (Staging & Production)
 
 ---
 
-## ۱. خط‌مشی حاکمیت اسناد زنده (Living Documentation Policy)
+## ۱. معماری سه‌لایه و مدیریت ولوم‌های پایدار (Updated Architecture with Named Volumes)
 
-> [!IMPORTANT]
-> این سند راهنمای رسمی، معتبر و زنده اپراتوری سامانه آرشیو اسناد سازمانی (`enterprise-archive-system`) است.
-> بر اساس سیاست حاکمیت مستندات پروژه، **به‌ازای هرگونه تغییر در معماری سرویس‌ها، ایمیج‌های داکر، ساختار متغیرهای محیطی (`.env`)، پورت‌ها، اسکریپت‌های پوشه `deploy/` یا کامپوننت‌های سفارشی، این سند باید بلافاصله و در همان کامیت به‌روزرسانی شود.**
-> هیچ تغییری در زیرساخت بدون بازتاب در این Runbook معتبر تلقی نخواهد شد.
-
----
-
-## ۲. تفکیک بنیادین وضعیت نرم‌افزار و وضعیت سامانه (Software State vs. Instance State)
-
-در مهندسی استقرار و بازیابی این سامانه، تفکیک دقیق میان دو لایه داده و کد الزامی است:
+در نسخه v2.0، جهت جلوگیری از **Shadow شدن فایل‌های هسته Nextcloud** (ناشی از بایند مانت پوشه خالی هاست روی `/var/www/html`) و همچنین رفع کامل **خطای دسترسی SQLite (`SQLITE_CANTOPEN` / Permission Denied)** در کانتینر AnythingLLM، معماری ذخیره‌سازی به ترکیبی از **Named Volumes مدیریت‌شده توسط داکر** و **Bind Mountهای ایزوله** ارتقا یافته است:
 
 ```text
-┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│                                             معماری لایه‌ای سامانه                                                │
-├───────────────────────────────────────────┬─────────────────────────────────────┬───────────────────────────────┤
-│      وضعیت نرم‌افزار (Software State)      │      وضعیت داده (Instance Data)     │   بسته سازگاری (Full Instance)│
-│    [منبع: گیت / system_only (BR-01)]      │   [منبع: instance_data (BR-02)]     │   [منبع: full_instance]       │
-├───────────────────────────────────────────┼─────────────────────────────────────┼───────────────────────────────┤
-│ • مخزن گیت و سورس‌کد پروژه                │ • پایگاه داده PostgreSQL (جداول)    │ • شامل هر دو لایه نرم‌افزار    │
-│ • تنظیمات هسته (config.php)              │ • اسناد و فایل‌های کاربران (data)   │   و داده‌های عملیاتی در یک    │
-│ • کلیدهای هویتی (salt, secret, instanceid)│ • فراداده اسناد و سیستم‌تگ‌ها        │   بسته تک‌فایلی جهت سازگاری   │
-│ • کانفیگ Nginx و docker-compose.yml       │ • اتصال به System Baseline مرجع    │   و پشتیبانی گذشته            │
-│ • اکیداً فاقد داده دیتابیس و فایل‌های data│ • اکیداً فاقد سورس و کانفیگ سیستم   │                               │
-└───────────────────────────────────────────┴─────────────────────────────────────┴───────────────────────────────┘
+                        ┌──────────────────────────────────────────────┐
+                        │     مخزن کلان: enterprise-archive-deploy     │
+                        └──────────────────────┬───────────────────────┘
+                                               │
+        ┌──────────────────────────────────────┼──────────────────────────────────────┐
+        ▼                                      ▼                                      ▼
+┌───────────────────────────┐      ┌───────────────────────────┐      ┌───────────────────────────┐
+│   لایه ۱: هسته آرشیو       │      │  لایه ۲: گیتوی و هسته AI   │      │  لایه ۳: یکپارچه‌سازی      │
+│      (archive_core)       │      │     (ai_box_gateway)      │      │   (integration_layer)     │
+├───────────────────────────┤      ├───────────────────────────┤      ├───────────────────────────┤
+│ • archive_proxy (Nginx)   │      │ • ai_box_gateway (:3001)  │      │ • AMQP Outbox Publisher   │
+│ • archive_app (Nextcloud) │◄────►│ • ai_box_anythingllm      │◄────►│ • Secure File Stream Proxy│
+│ • archive_db (Postgres 15)│      │ • ai_box_ollama           │      │ • RabbitMQ Event Consumer │
+│                           │      │ • ai_box_rabbitmq (:5672) │      │                           │
+└─────────────┬─────────────┘      └─────────────┬─────────────┘      └───────────────────────────┘
+              │                                  │
+              ▼                                  ▼
+┌─────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                              لایه ذخیره‌سازی پایدار (Storage Layer)                              │
+├─────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ 1. Docker Named Volumes (مدیریت خودکار سورس و دیتابیس بدون تداخل با فایل‌سیستم هاست):             │
+│    • nextcloud_html   ──► /var/www/html (تزریق خودکار هسته Nextcloud توسط entrypoint رسمی)       │
+│    • archive_db_data  ──► /var/lib/postgresql/data (پایداری ۱۴۵ جدول دیتابیس PostgreSQL)        │
+│    • ollama_models    ──► /root/.ollama (نگهداری وزن مدل‌های زبانی و Embedding)                  │
+│                                                                                                 │
+│ 2. Selective Bind Mounts (فقط برای کدهای سفارشی و داده‌های مشترک با UID/GID تنظیم‌شده):          │
+│    • ./archive_core/apps/archive_autotag ──► /var/www/html/custom_apps/archive_autotag:ro       │
+│    • ./ai_box_gateway/data/anythingllm   ──► /app/server/storage (با مالکیت الزامی 1000:1000)   │
+└─────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### مزایای کلیدی معماری ولوم‌های v2.0:
+1. **حذف خطای Shadowing در Nextcloud:** با استفاده از Named Volume به نام `nextcloud_html`، ایمیج رسمی `nextcloud:apache` در اولین راه‌اندازی به طور خودکار تمامی فایل‌های هسته را درون ولوم کپی کرده و اپ سفارشی `archive_autotag` به صورت Read-Only در مسیر `custom_apps/archive_autotag` مانت می‌شود.
+2. **تضمین دسترسی SQLite در AnythingLLM:** کانتینر AnythingLLM با کاربر داخلی `uid=1000(anythingllm)` اجرا می‌شود. پیش از بالا آمدن کانتینرها، مسیر `./ai_box_gateway/data/anythingllm` ساخته شده و مالکیت `1000:1000` با سطح دسترسی `775` روی آن اعمال می‌گردد.
+
+---
+
+## ۲. جدول متغیرهای محیطی الزامی (`.env`)
+
+پیش از اجرای استقرار، فایل `.env` در ریشه مخزن `enterprise-archive-deploy` باید بر اساس جدول زیر پیکربندی شود:
+
+| نام متغیر | مقدار پیش‌فرض / نمونه | سرویس مصرف‌کننده | شرح کاربرد |
+| :--- | :--- | :--- | :--- |
+| `POSTGRES_DB` | `nextcloud` | `db`, `app` | نام پایگاه داده اصلی در PostgreSQL |
+| `POSTGRES_USER` | `nextcloud_user` | `db`, `app` | نام کاربری پایگاه داده |
+| `POSTGRES_PASSWORD` | `StrongDBPass123!` | `db`, `app` | رمز عبور پایگاه داده (الزامی) |
+| `NEXTCLOUD_ADMIN_USER` | `admin` | `app` | نام کاربری مدیر ارشد سامانه در نصب اولیه |
+| `NEXTCLOUD_ADMIN_PASSWORD` | `StrongAdminPass123!` | `app` | رمز عبور مدیر ارشد سامانه (الزامی) |
+| `NEXTCLOUD_TRUSTED_DOMAINS` | `"localhost 127.0.0.1 docs.maskan"` | `app` | لیست دامنه‌ها و IPهای مجاز دسترسی به پورتال |
+| `GATEWAY_PORT` | `3001` | `gateway` | پورت محلی درگاه امنیتی هوش مصنوعی |
+| `BACKEND_HOST` | `anythingllm` | `gateway` | آدرس سرویس داخلی موتور RAG |
+| `BACKEND_PORT` | `3001` | `gateway` | پورت داخلی سرویس AnythingLLM |
+| `INTERNAL_SERVICE_KEY` | `ai_box_internal_api_secret_key` | `gateway` | کلید مشترک احراز هویت داخلی سرویس‌ها |
+| `DESTINATION_API_KEY` | `ai_box_internal_api_secret_key` | `gateway` | کلید API ارتباط با مقصد پردازش هوش مصنوعی |
+| `SESSION_ACL_CACHE_TTL` | `3600` | `gateway` | زمان اعتبار کش نشست‌های کاربری (بر حسب ثانیه) |
+| `VECTOR_DB` | `lancedb` | `anythingllm` | موتور پایگاه داده برداری داخلی |
+| `EMBEDDING_MODEL_PREF` | `qwen2.5:0.5b-instruct` | `anythingllm` | مدل پیش‌فرض استنتاج و برداری‌سازی در Ollama |
+| `RABBITMQ_DEFAULT_USER` | `guest` | `rabbitmq` | نام کاربری کارگزار پیام RabbitMQ |
+| `RABBITMQ_DEFAULT_PASS` | `guest` | `rabbitmq` | رمز عبور کارگزار پیام RabbitMQ |
+| `RABBITMQ_PORT` | `5672` | `rabbitmq` | پورت پروتکل AMQP روی هاست |
+
+---
+
+## ۳. اسکریپت خودکار استقرار یکپارچه (`deploy.sh`)
+
+برای استقرار بدون خطا در سرور جدید (Staging یا Production)، اسکریپت `deploy.sh` زیر را در ریشه مخزن `enterprise-archive-deploy` ایجاد و اجرا نمایید. این اسکریپت تمامی پیش‌نیازهای دایرکتوری، مجوزهای `1000:1000` برای SQLite در AnythingLLM، راه‌اندازی کانتینرها و فعال‌سازی ماژول `archive_autotag` را به صورت خودکار انجام می‌دهد:
+
+```bash
+cat << 'EOF' > deploy.sh
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "=================================================================="
+echo " Enterprise Archive System - Unified Deployment Script (v2.0)"
+echo "=================================================================="
+
+# ۱. بررسی و همگام‌سازی زیرماژول‌های گیت
+echo "[1/6] Syncing Git submodules on branch release/v2-staging-verified..."
+git submodule update --init --recursive
+
+# ۲. بررسی وجود فایل .env
+if [ ! -f .env ]; then
+    echo "[2/6] Creating .env from .env.example..."
+    cp .env.example .env
+else
+    echo "[2/6] Using existing .env file."
+fi
+
+# ۳. ایجاد دایرکتوری‌های داده و تنظیم مجوزهای AnythingLLM (رفع خطای SQLite)
+echo "[3/6] Preparing AI Box storage directories and permissions (UID 1000:1000)..."
+mkdir -p ./ai_box_gateway/data/anythingllm
+mkdir -p ./ai_box_gateway/data/rabbitmq
+
+if [ -f ./archive_core/data/gid_workspace_map.json ] && [ ! -f ./ai_box_gateway/data/gid_workspace_map.json ]; then
+    cp ./archive_core/data/gid_workspace_map.json ./ai_box_gateway/data/gid_workspace_map.json
+elif [ ! -f ./ai_box_gateway/data/gid_workspace_map.json ]; then
+    echo "{}" > ./ai_box_gateway/data/gid_workspace_map.json
+fi
+
+sudo chown -R 1000:1000 ./ai_box_gateway/data/anythingllm
+sudo chmod -R 775 ./ai_box_gateway/data/anythingllm
+sudo chmod 664 ./ai_box_gateway/data/gid_workspace_map.json || true
+
+# ۴. راه‌اندازی و ساخت سرویس‌های ۷گانه داکر
+echo "[4/6] Launching 7 Docker containers with Named Volumes..."
+docker compose up -d --build
+
+# ۵. انتظار برای تکمیل نصب اولیه Nextcloud در Named Volume
+echo "[5/6] Waiting for Nextcloud core initialization inside nextcloud_html volume..."
+MAX_RETRIES=30
+COUNT=0
+until docker exec -u www-data archive_app php occ status 2>/dev/null | grep -q "installed: true"; do
+    COUNT=$((COUNT + 1))
+    if [ "$COUNT" -ge "$MAX_RETRIES" ]; then
+        echo "ERROR: Nextcloud initialization timed out after $MAX_RETRIES attempts."
+        exit 1
+    fi
+    echo "  -> Waiting for Nextcloud installation to finish... ($COUNT/$MAX_RETRIES)"
+    sleep 5
+done
+
+# ۶. فعال‌سازی ماژول سفارشی archive_autotag و ایجاد پوشه ریشه سازمانی
+echo "[6/6] Enabling archive_autotag app and initializing Enterprise_Archive root..."
+docker exec -u www-data archive_app php occ app:enable archive_autotag
+docker exec -u www-data archive_app bash -c "
+    mkdir -p /var/www/html/data/admin/files/Enterprise_Archive &&
+    chown -R www-data:www-data /var/www/html/data/admin/files/Enterprise_Archive &&
+    chmod 0770 /var/www/html/data/admin/files/Enterprise_Archive
+"
+docker exec -u www-data archive_app php occ files:scan --all
+
+echo "=================================================================="
+echo " Deployment Completed Successfully!"
+echo "=================================================================="
+EOF
+
+chmod +x deploy.sh
+./deploy.sh
 ```
 
 ---
 
-## ۳. خلاصه سناریوهای عملیاتی بازیابی و استقرار
+## ۴. سناریوهای ۴گانه اعتبارسنجی عملیاتی (Operational Verification Scenarios)
 
-در این چارچوب معماری، سناریوهای بازسازی و بازیابی به صورت کاملاً مستقل تفکیک شده‌اند:
+پس از اتمام اجرای `deploy.sh`، هر ۴ سناریوی زیر باید اجرا شده و خروجی مورد انتظار تایید گردد:
 
-```text
-                               ┌────────────────────────────────────────┐
-                               │     نوع سناریوی عملیاتی / بحران        │
-                               └───────────────────┬────────────────────┘
-                                                   │
-         ┌─────────────────────────────────────────┼─────────────────────────────────────────┐
-         ▼                                         ▼                                         ▼
-┌─────────────────────────────────┐       ┌─────────────────────────────────┐       ┌─────────────────────────────────┐
-│ سناریوی ۱: بازیابی داده پروداکشن │       │ سناریوی ۲: بازسازی فاجعه (DR)   │       │ سناریوی ۳: استقرار تمیز از صفر  │
-│ (BR-04: Hardened Data Restore)  │       │ (BR-05: Rebuild on Lost Server) │       │ (Clean OS Fresh Install)        │
-├─────────────────────────────────┤       ├─────────────────────────────────┤       ├─────────────────────────────────┤
-│ • سرور سالم و در حال سرویس‌دهی  │       │ • سرور قبلی کلاً نابود / سوخته  │       │ • راه‌اندازی اولیه و نو سامانه │
-│ • نرم‌افزار و کانفیگ دست‌نخورده │       │ • بازسازی سیستم با System Backup│       │ • فاقد هرگونه داده یا بکاپ قبلی │
-│ • فقط بازگردانی DB + User Data  │       │ • سپس بازیابی داده‌های عملیاتی  │       │ • تولید سالت‌ها و کلیدهای تازه │
-│ • مجهز به Pre-Restore Backup    │       │ • احیای کامل کل سرور در بحران   │       │ • نصب خودکار با اسکریپت ساختار │
-│ • گیت‌های Fail-Closed و Health  │       │ • ترکیب BR-01 + BR-02           │       │ • موتور: deploy_from_scratch    │
-│ • موتور: restore_instance_data  │       │ • بازیابی کامل تمام لایه‌ها     │       │ • استقرار کانتینری استاندارد    │
-└─────────────────────────────────┘       └─────────────────────────────────┘       └─────────────────────────────────┘
+### سناریوی ۱: بررسی سلامت کانتینرها و شبکه (Health Check)
+```bash
+docker compose ps
 ```
+- **معیار پذیرش:** هر ۷ کانتینر (`archive_db`, `archive_app`, `archive_proxy`, `ai_box_ollama`, `ai_box_anythingllm`, `ai_box_gateway`, `ai_box_rabbitmq`) باید در وضعیت `Up` باشند و کانتینرهای دارای Healthcheck (`archive_db`, `ai_box_rabbitmq`, `ai_box_anythingllm`) وضعیت `(healthy)` را نشان دهند.
+
+### سناریوی ۲: بررسی وضعیت دیتابیس و هسته Nextcloud (DB & Core Check)
+```bash
+# بررسی وضعیت نصب Nextcloud
+docker exec -u www-data archive_app php occ status
+
+# بررسی تعداد جداول ایجادشده در PostgreSQL
+docker exec archive_db psql -U nextcloud_user -d nextcloud -t -A -c \
+  "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public';"
+```
+- **معیار پذیرش:** خروجی `occ status` باید `installed: true` و `maintenance: false` باشد و پایگاه داده شامل جداول کامل هسته و ماژول آرشیو (از جمله `oc_archive_tag_ownership` و `oc_archive_ai_outbox`) باشد.
+
+### سناریوی ۳: بررسی سلامت AnythingLLM و دیتابیس SQLite (AnythingLLM Status)
+```bash
+# بررسی عدم وجود خطای مجوز SQLite در لاگ‌های AnythingLLM
+docker logs --tail 50 ai_box_anythingllm
+
+# بررسی ایجاد فایل دیتابیس SQLite در مسیر استوریج
+ls -lh ./ai_box_gateway/data/anythingllm/anythingllm.db
+
+# تست پاسخ‌دهی گیتوی هوش مصنوعی
+curl -i http://127.0.0.1:3001/api/v1/workspaces
+```
+- **معیار پذیرش:** فایل `anythingllm.db` با مالکیت `1000:1000` ایجاد شده باشد، هیچ خطای `Unable to open the database file` در لاگ‌ها نباشد و پورت `3001` گیتوی پاسخ HTTP برگرداند (کد `401`/`403` برای درخواست بدون کوکی سشن که نشان‌دهنده فعال بودن لایه امنیتی گیتوی است).
+
+### سناریوی ۴: بررسی خودترمیم گروه دسترسی هوش مصنوعی و ماژول تگ‌گذاری (Auto-tag & Self-Healing Group)
+```bash
+# بررسی فعال بودن اپ archive_autotag
+docker exec -u www-data archive_app php occ app:list | grep archive_autotag
+
+# بررسی ایجاد خودکار گروه ai_chat_access توسط Application::boot()
+docker exec -u www-data archive_app php occ group:list | grep ai_chat_access
+```
+- **معیار پذیرش:** اپلیکیشن `archive_autotag` در لیست `Enabled` قرار داشته باشد و گروه `ai_chat_access` به صورت خودکار در لیست گروه‌های سیستم ثبت شده باشد.
 
 ---
 
-### ۳.۱. مشخصات سناریوی ۱: بازیابی داده‌های عملیاتی روی سامانه سالم (BR-04 Final Hardening)
-در این سناریو، سرور عملیاتی کاملاً سالم و بالا است و صرفاً نیاز به بازیابی پایگاه داده و فایل‌های اسناد کاربران (`instance_data`) به یک نقطه بازیابی معتبر وجود دارد. این سناریو مجهز به گیت‌های مقاوم‌سازی نهایی زیر است:
-- **ترتیب قطعی گیت سلامت:** آزمون سلامت سامانه (`check_health.sh`) **پیش از** خروج از حالت تعمیرات اجرا می‌گردد. در صورت عدم قبولی سلامت، خروج از حالت تعمیرات اکیداً انجام نشده و سامانه در حالت امن Maintenance ON باقی می‌ماند.
-- **آماده‌سازی Fail-Closed پایگاه داده:** هرگونه خطا در بستن اتصالات یا قطع نشست‌های فعال، فرآیند بازیابی مخرب را فوراً متوقف می‌سازد (حذف کامل `|| true`).
-- **امنیت فایل‌های وضعیت:** فایل‌های وضعیت دارای مجوزهای غیرقابل دستکاری عمومی (`chmod 0660` با گروه `www-data`) هستند.
-- **شناسه واقعی درخواست‌کننده:** هویت واقعی مدیر از وب یا CLI به صورت End-to-End ثبت می‌شود و Fallback مصنوعی به `admin` حذف گردیده است.
-- **آزمون‌های تزریق خرابی:** کلیه سناریوهای A تا R به همراه آزمون بازگشت زنده (Live Reversion Test) با موفقیت اعتبارسنجی شده‌اند.
+## ۵. دستورالعمل ریست کامل و پاکسازی محیط تستی (Clean State Reset)
 
-> [!NOTE]
-> **وضعیت نیازمندی BR-05 (Rebuild on Lost Server):**
-> نیازمندی BR-05 مربوط به فازهای آتی نقشه راه بوده و در این مرحله **آغاز نشده است (Status: NOT STARTED)**.
-
----
-
-## ۴. پیش‌نیازهای زیرساختی و سخت‌افزاری (Prerequisites)
-
-### ۴.۱. مشخصات سخت‌افزاری پیشنهادی
-- **پردازنده (CPU):** حداقل ۴ هسته (توصیه: ۸ هسته).
-- **حافظه رم (RAM):** حداقل ۸ گیگابایت (توصیه: ۱۶ گیگابایت).
-- **فضای دیسک (Storage):** حداقل ۵۰ گیگابایت SSD برای سیستم‌عامل و دیتابیس + فضای متناسب با آرشیو اسناد.
-- **شبکه:** کارت شبکه ۱ گیگابیت بر ثانیه یا بالاتر با IP استاتیک اختصاصی.
-
-### ۴.۲. نیازمندی‌های نرم‌افزاری سیستم‌عامل
-- **سیستم‌عامل تاییدشده:** Ubuntu Server 22.04 LTS / 24.04 LTS یا Debian 12.
-- **موتور کانتینری:** Docker Engine نسخه ۲۴.۰ یا بالاتر.
-- **ارکستراسیون:** Docker Compose Plugin نسخه ۲.۲۰ یا بالاتر (`docker compose`).
-- **بسته‌های سیستمی:** `curl`, `git`, `jq`, `tar`, `gzip`, `sha256sum`, `postgresql-client`.
-
----
-
-## ۵. دستورالعمل اجرایی سناریوی الف (Scenario A: Rebuild + Restore)
-
-**مورد کاربرد:** سرور قبلی نابود شده، سوخته یا تعویض گردیده است، اما یک نسخه پشتیبان معتبر و سالم (`backup_full_instance_*.tar.gz` به همراه فایل هش `.sha256`) در اختیار داریم.
-
-### گام ۵.۱: نیازمندی‌های قطعی بازسازی سناریوی الف
-
-| مؤلفه | منبع تامین در سناریوی الف | نقش در بازسازی |
-| :--- | :--- | :--- |
-| **کد منبع و اسکریپت‌ها** | مخزن گیت (`git clone`) | تامین Software State، ماژول‌های ۵۳ گانه، وب‌پروکسی و شل‌های عملیاتی. |
-| **نسخه پشتیبان (`full_instance`)** | محل امن ذخیره‌سازی بکاپ | تامین Instance State، شامل دیتابیس، فایل‌ها، کانفیگ، کلیدهای هویتی و اپ‌های جانبی. |
-| **فایل متغیرها (`.env`)** | صندوق امن اسرار (Secret Vault) | تامین پسورد دیتابیس و اعتبارسنجی اتصال بدون کامیت در گیت. |
-
-### گام ۵.۲: کلون مخزن و راه‌اندازی متغیرهای محیطی در سرور جدید
-```bash
-cd /home/$USER
-git clone <REPOSITORY_URL> enterprise-archive-system
-cd enterprise-archive-system
-
-# ایجاد فایل متغیرها از روی الگو با دسترسی امن
-cp .env.example .env
-chmod 600 .env
-
-# وارد کردن متغیرهای رمزنگاری و اتصال
-nano .env
-```
-
-> [!CAUTION]
-> **مدیریت امن رمزها و کلیدها:**
-> فایل `.env` نباید به هیچ عنوان به گیت کامیت شود. مقادیر `POSTGRES_PASSWORD` و رمزهای عبور باید از کانال امن (مانند Vault سازمانی یا فایل رمزگذاری‌شده محلی) به سرور جدید منتقل شوند.
-
-### گام ۵.۳: انتقال بسته پشتیبان و اعتبارسنجی امضای دیجیتال
-```bash
-mkdir -p deploy/backups
-# انتقال فایل‌های بکاپ از هاست امن
-cp /path/to/backup_full_instance_*.tar.gz deploy/backups/latest_instance_backup.tar.gz
-cp /path/to/backup_full_instance_*.tar.gz.sha256 deploy/backups/latest_instance_backup.tar.gz.sha256
-
-# اعتبارسنجی اولیه امضای دیجیتال خارج از آرشیو
-cd deploy/backups
-sha256sum -c latest_instance_backup.tar.gz.sha256
-cd ../..
-```
-
-### گام ۵.۴: اجرای بازیابی کامل اتمیک (Atomic Restore)
-```bash
-# روشن کردن دیتابیس
-docker compose up -d db
-
-# اجرای موتور بازیابی
-./deploy/restore_db.sh deploy/backups/latest_instance_backup.tar.gz
-```
-
-#### فرآیند درون‌برنامه‌ای `restore_db.sh`:
-1. **بررسی امضای دیجیتال:** فایل‌های آرشیو و اجزای داخلی را با مانیفست مقایسه می‌کند.
-2. **بررسی حضور تمام ۵ جزء الزامی:** `database.sql`, `data.tar.gz`, `config.tar.gz`, `config_keys.json`, `custom_apps.tar.gz`.
-3. **ریست ساختار دیتابیس:** دیتابیس قبلی را پاک کرده و اسکریپت SQL را با پرچم `ON_ERROR_STOP=1` درون‌ریزی می‌کند.
-4. **استخراج فایل‌های داده و کانفیگ:** فایل‌ها با حفظ دسترسی `www-data` استخراج می‌شوند.
-5. **تضمین ثبات هویت:** کلیدهای `passwordsalt`، `secret` و `instanceid` از بکاپ به `config.php` تزریق می‌شوند تا رمزهای عبور کاربران بدون هیچ تغییری کار کنند.
-6. **بازسازی کش و فعال‌سازی سرویس‌ها:** سرویس‌ها روشن شده و شاخص اسناد بازسازی می‌گردد.
-
-### گام ۵.۵: ممیزی و ارزیابی پس از بازیابی
-```bash
-./deploy/check_health.sh
-./venv/bin/python3 -m unittest tests/test_backup_and_recovery.py tests/test_system_deployment_and_recovery.py
-```
-
-### گام ۵.۶: هماهنگ‌کننده پیشرفته بازیابی فاجعه (BR-05 Full Disaster Recovery Orchestrator)
-
-در معماری نوین BR-05، بازیابی بر روی هاست جدید به جای اجرای دستی مراحل، از طریق هماهنگ‌کننده خودکار `orchestrate_disaster_recovery.sh` اجرا می‌شود. این هماهنگ‌کننده با ماشین وضعیت ۱۳ مرحله‌ای:
-1. کامیت دقیق گیت (`FROZEN_GIT_COMMIT`) و دایجست ایمیج‌های داکر را اعتبارسنجی می‌کند.
-2. با جفت‌سازی `system_only` و `instance_data`، ابتدا لایه سیستم را مستقر و از دروازه `System Gate` عبور می‌دهد.
-3. داده‌های پایگاه داده و فایل‌ها را با اعتبارسنجی دوطرفه DB ↔ Files بازیابی می‌کند.
-4. آزمون‌های ساختاری، تابعی، اعتبارسنجی احراز هویت بدون ریست پسورد، ایزولاسیون دسترسی گروه‌ها و جستجوی اسناد را کنترل می‌کند.
-5. خروج اینترنت را از طریق دروازه Air-Gapped قطع و پس از احراز سلامت نهایی، سامانه را `OPERATIONAL` اعلام می‌کند.
+در صورتی که در محیط آزمایشگاهی (Staging) نیاز به پاکسازی کامل تمامی داده‌ها، ولوم‌های داکر (`nextcloud_html`, `archive_db_data`, `ollama_models`) و بازگشت به نقطه صفر پیش از استقرار مجدد باشد، دستورات زیر را به ترتیب اجرا کنید:
 
 ```bash
-# اجرای بازیابی فاجعه روی هاست جدید
-./deploy/orchestrate_disaster_recovery.sh \
-    --system-backup deploy/backups/latest_system_backup.tar.gz \
-    --data-backup deploy/backups/latest_instance_data_backup.tar.gz \
-    --target-env host \
-    --target-port 80
+# ۱. توقف کانتینرها و حذف کامل Named Volumes و شبکه‌ها
+docker compose down -v --remove-orphans
+
+# ۲. پاکسازی داده‌های زمان اجرای AnythingLLM و RabbitMQ روی هاست
+sudo rm -rf ./ai_box_gateway/data/anythingllm/*
+sudo rm -rf ./ai_box_gateway/data/rabbitmq/*
+sudo rm -f ./ai_box_gateway/data/*.db ./ai_box_gateway/data/*.db-shm ./ai_box_gateway/data/*.db-wal
+
+# ۳. بازسازی مجدد ساختار تمیز و اجرای استقرار از صفر
+./deploy.sh
 ```
 
----
-
-## ۶. دستورالعمل اجرایی سناریوی ب (Scenario B: Fresh Deployment)
-
-**مورد کاربرد:** نصب و استقرار سامانه برای اولین بار در یک سازمان یا محیط جدید، **بدون پیشینه قبلی و بدون اطلاعات پیشین**.
-
-> [!NOTE]
-> در سناریوی ب **هیچ عملیات Restore انجام نمی‌شود**. کلیدها، نمک‌های رمزنگاری و پایگاه‌داده به صورت خودکار و از صفر ایجاد می‌شوند.
-
-### گام ۶.۱: کلون مخزن و ایجاد متغیرهای محیطی نو
-```bash
-cd /home/$USER
-git clone <REPOSITORY_URL> enterprise-archive-system
-cd enterprise-archive-system
-
-cp .env.example .env
-chmod 600 .env
-nano .env
-```
-
-### گام ۶.۲: اجرای اسکریپت استقرار تمیز (`deploy_from_scratch.sh`)
-```bash
-./deploy/deploy_from_scratch.sh
-```
-
-#### فرآیند خودکار سناریوی ب:
-1. راه‌اندازی کانتینرهای پایگاه داده، اپلیکیشن و پروکسی.
-2. اجرای نصب هدلس (Headless Nextcloud Installation) با تولید `instanceid` و نمک‌های رمزنگاری کاملاً نو و منحصر‌به‌فرد.
-3. فعال‌سازی اپلیکیشن سفارشی `archive_autotag`.
-4. اعمال شِماهای جداول اختصاصی سامانه (`oc_archive_document_metadata` و غیره).
-5. ایجاد کاربران، گروه‌های سازمانی و ساختار پوشه آرشیو پیش‌فرض.
-
-### گام ۶.۳: بررسی سلامت استقرار نو
-```bash
-./deploy/check_health.sh
-```
-
----
-
-## ۷. دیمن مانیتورینگ و پشتیبان‌گیری خودکار (`backup_daemon.sh`)
-
-جهت اجرای خودکار پشتیبان‌گیری و پالایش نسخه‌های قدیمی، سرویس دیمن باید به صورت مداوم در پس‌زمینه فعال باشد:
-
-```bash
-# نصب و فعال‌سازی به عنوان سرویس سیستمی systemd
-sudo cp deploy/enterprise-archive-daemon.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now enterprise-archive-daemon.service
-sudo systemctl status enterprise-archive-daemon.service
-```
-
----
-
-## ۸. دستورات خط فرمان کنسول اپراتور (`manage_backup.sh`)
-
-```bash
-# مشاهده وضعیت سلامت، وضعیت دیمن و آخرین نسخه بکاپ
-./deploy/manage_backup.sh status
-
-# مشاهده فهرست فایل‌های پشتیبان و کدهای هش
-./deploy/manage_backup.sh list
-
-# اجرای پشتیبان‌گیری سیستم مستقل از داده (Software + Config + Identity Keys)
-./deploy/manage_backup.sh backup-system
-
-# اجرای فوری یک نسخه پشتیبان جامع سازمانی (Full Instance)
-./deploy/manage_backup.sh run
-
-# اجرای آزمون اعتبارسنجی نسخه پشتیبان سیستم (عدم وجود دیتای عملیاتی و تمامیت کد)
-./deploy/manage_backup.sh test-system deploy/backups/latest_system_backup.tar.gz
-
-# اجرای آزمون سلامت بازیابی در سندباکس ایزوله
-./deploy/manage_backup.sh test deploy/backups/latest_instance_backup.tar.gz
-
-# اجرای بازیابی در ترمینال
-./deploy/manage_backup.sh restore deploy/backups/latest_instance_backup.tar.gz
-
-# اجرای پشتیبان‌گیری داده‌های عملیاتی (BR-02 Instance Data Backup)
-./deploy/manage_backup.sh backup-data
-
-# آزمون داده‌های عملیاتی در سندباکس (BR-03 Sandbox Test)
-./deploy/manage_backup.sh test-data deploy/backups/latest_instance_data_backup.tar.gz
-
-# بازیابی داده‌های عملیاتی روی سرور سالم پروداکشن (BR-04 Production Restore)
-./deploy/manage_backup.sh restore-data deploy/backups/latest_instance_data_backup.tar.gz
-
-# مانور کامل بازیابی در شرایط فاجعه روی محیط ایزوله (BR-05 Disaster Recovery Drill)
-./deploy/manage_backup.sh dr
-
-# پالایش نسخه‌های قدیمی بر اساس سقف ماندگاری
-./deploy/manage_backup.sh prune
-```
-
----
-
-## ۹. راهنمای Rollback ایمن و مقابله با شکست در استقرار
-
-> [!CAUTION]
-> **قانون قطعی عدم استفاده از دستورات مخرب:**
-> در هنگام بروز خطا در سناریوی A یا B، هرگز بدون بررسی لاگ‌ها و بدون هماهنگی اقدام به اجرای دستورات حذف مستقیم دایرکتوری‌ها نکنید. دستوراتی نظیر `rm -rf db/*` یا `docker compose down -v` اطلاعات حیاتی را نابود می‌کنند.
-
-### مراحل مجاز و ایمن برای Rollback:
-1. **بررسی لاگ‌های شکست:**
-   ```bash
-   cat deploy/restore_error.log
-   docker compose logs db --tail=100
-   docker compose logs app --tail=100
-   ```
-2. **حفظ حالت ایزوله (Maintenance Mode):** در صورتی که Restore ناموفق شود، کانتینرها در حالت تعمیرات متوقف مانده‌اند تا داده ناقص افشا نشود.
-3. **تکرار بازیابی با نسخه پشتیبان دیگر:** اگر نسخه انتخابی خراب بود، فرآیند را با نسخه دیگری از جدول بکاپ‌ها تکرار نمایید.
-4. **تنها در سناریوی ب (Fresh Deployment):** در صورتی که استقرار از صفر با خطای ساختاری مواجه شد و هیچ دیتایی برای نگهداری وجود ندارد، پس از تایید اپراتور و بررسی فایل `.env`، دستور ریست کانتینرها و ایجاد مجدد قابل اجراست.
-
----
-
-## ۱۰. چک‌لیست نهایی تحویل سامانه (Production Handover Checklist)
-
-- [ ] اجرای موفق `./deploy/check_health.sh` و دریافت وضعیت سبز.
-- [ ] اجرای موفق آزمون‌های پایتون: `./venv/bin/python3 -m unittest tests/test_backup_and_recovery.py tests/test_system_deployment_and_recovery.py`.
-- [ ] ورود موفقیت‌آمیز حساب کاربری مدیر ارشد (`admin`) و کاربران عادی سازمانی با رمزهای پیشین.
-- [ ] مشاهده صحیح ساختار درختی پوشه `/Enterprise_Archive` و متاداده‌های اسناد.
-- [ ] بررسی فعال بودن دیمن پشتیبان‌گیری (`systemctl status enterprise-archive-daemon.service`).
-- [ ] اطمینان از قرار داشتن فایل `.env` تحت مجوز امن `chmod 600 .env` و عدم کامیت آن در گیت.
+> [!WARNING]
+> اجرای `docker compose down -v` تمامی ولوم‌های پایدار شامل دیتابیس PostgreSQL و فایل‌های آپلودشده در Nextcloud را به طور کامل حذف می‌کند. استفاده از این دستور صرفاً در سرور آزمایشگاهی (Staging) مجاز بوده و در محیط عملیاتی (Production) اکیداً ممنوع است.
